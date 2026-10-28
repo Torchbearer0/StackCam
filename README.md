@@ -1,12 +1,15 @@
-# StackCam (v0.1)
+# StackCam v0.2
 
-Camera2 long-exposure and clone camera, built for a Vivo X60 Pro. Pure framework code, no dependencies, no INTERNET permission.
+Camera2 camera for a Vivo X60 Pro. Pure framework code, no dependencies, no INTERNET permission.
 
-Modes: Photo/Pro (manual shutter, ISO), Silky water (average), Light trails, Traffic trails, Light painting, Star trails (lighten stack), Clone (median background + pasted subject).
-Hold the phone in landscape. Photos save to Pictures/StackCam.
+Modes (swipe the strip above the shutter): Video, Photo, Portrait (focus-sweep bokeh), Pro (manual shutter/ISO/focus),
+Time-lapse (MP4), Long exposure (silky water, light trails, traffic trails, light painting, star trails),
+Astro (star-aligned stack with auto stretch for Milky Way), Clone.
+
+Portrait UI. Photos save to Pictures/StackCam, videos to Movies/StackCam. Output is rotated using the phone's orientation sensor.
+Gear icon: mirror / flip preview and grid (use if the viewfinder ever looks flipped).
 
 ## Build with GitHub
-1. Create a new GitHub repo and upload everything in this folder (keep the .github folder and app/debug.keystore).
-2. Open the Actions tab -> "Build APK" -> run it (it also runs on every push to main).
-3. When it finishes, open the run and download the artifact "stackcam-debug-apk". It is a zip containing app-debug.apk.
-4. Install the APK. Later builds install over the old one because the debug key is fixed.
+1. Upload everything in this folder to a GitHub repo (keep .github and app/debug.keystore).
+2. Actions -> "Build APK" -> run. Download the artifact "stackcam-debug-apk" (zip with app-debug.apk).
+3. Install over the old version (same debug key).

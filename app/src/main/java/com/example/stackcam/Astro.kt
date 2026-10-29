@@ -1,5 +1,6 @@
 package com.example.stackcam
 
+import android.media.Image
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -272,91 +273,103 @@ class AstroStacker(private val w: Int, private val h: Int, private val align: Bo
 }
 
 /**
- * Focus-sweep bokeh. A set of shots at different focus distances gives a depth-from-focus map;
- * everything away from the chosen subject depth is blurred progressively.
+ * Focus-sweep bokeh, streaming version. Shots at different focus distances give a depth-from-focus map
+ * (in diopters). The first shot is the sharp subject (autofocus on the tapped spot); everything whose
+ * depth differs from the subject is blurred progressively. Only the subject frame is kept at full size.
  */
-object Bokeh {
-    fun compose(frames: List<IntArray>, w: Int, h: Int, sx: Float, sy: Float, strength: Int): IntArray {
-        val k = frames.size
-        val hw = w / 2
-        val hh = h / 2
-        val hn = hw * hh
-        var num = FloatArray(hn)
-        var den = FloatArray(hn)
-        val lum = FloatArray(hn)
-        for (f in 0 until k) {
-            val fr = frames[f]
-            for (y in 0 until hh) {
-                val o = (y * 2) * w
-                for (x in 0 until hw) {
-                    val p = fr[o + x * 2]
-                    lum[y * hw + x] = (((p shr 16) and 255) * 77 + ((p shr 8) and 255) * 150 + (p and 255) * 29) / 256f
-                }
-            }
-            var lap = FloatArray(hn)
-            for (y in 1 until hh - 1) for (x in 1 until hw - 1) {
-                val i = y * hw + x
-                val l = abs(4f * lum[i] - lum[i - 1] - lum[i + 1] - lum[i - hw] - lum[i + hw])
-                lap[i] = l * l
-            }
-            lap = boxBlurF(lap, hw, hh, 3)
-            for (i in 0 until hn) {
-                val s = lap[i]
-                num[i] += f * s
-                den[i] += s
+class BokehAccum(private val w: Int, private val h: Int) {
+    private val hw = w / 2
+    private val hh = h / 2
+    private val hn = hw * hh
+    private var num = FloatArray(hn)
+    private var den = FloatArray(hn)
+    private val lum = FloatArray(hn)
+    private var subject: IntArray? = null
+    private var d0 = 0f
+    var shots = 0
+        private set
+
+    fun add(img: Image, diopter: Float, isSubject: Boolean, scratch: IntArray) {
+        val yp = img.planes[0]
+        val buf = yp.buffer
+        val rs = yp.rowStride
+        for (y in 0 until hh) {
+            val o = (y * 2) * rs
+            for (x in 0 until hw) lum[y * hw + x] = (buf.get(o + x * 2).toInt() and 255).toFloat()
+        }
+        var lap = FloatArray(hn)
+        for (y in 1 until hh - 1) for (x in 1 until hw - 1) {
+            val i = y * hw + x
+            val l = abs(4f * lum[i] - lum[i - 1] - lum[i + 1] - lum[i - hw] - lum[i + hw])
+            lap[i] = l * l
+        }
+        lap = boxBlurF(lap, hw, hh, 3)
+        for (i in 0 until hn) {
+            val s = lap[i]
+            num[i] += diopter * s
+            den[i] += s
+        }
+        if (isSubject) {
+            Yuv.toArgb(img, scratch)
+            subject = scratch.copyOf()
+            d0 = diopter
+        }
+        shots++
+    }
+
+    private fun blur2(src: IntArray, bw: Int, bh: Int, r: Int): IntArray {
+        val rr = max(r * 7 / 10, 1)
+        return boxBlurArgb(boxBlurArgb(src, bw, bh, rr), bw, bh, rr)
+    }
+
+    fun result(strength: Int): IntArray {
+        val subj = subject ?: throw IllegalStateException("No subject frame")
+        val sc = w / 1920f
+        val rr = max((12 * sc).toInt(), 6)
+        num = boxBlurF(boxBlurF(num, hw, hh, rr), hw, hh, rr)
+        den = boxBlurF(boxBlurF(den, hw, hh, rr), hw, hh, rr)
+        val tol = 0.08f + 0.05f * d0
+        val span = 0.30f + 0.30f * d0
+        val amt = FloatArray(hn) { i ->
+            val depth = if (den[i] > 1e-3f) num[i] / den[i] else d0
+            ((abs(depth - d0) - tol) / span).coerceIn(0f, 1f)
+        }
+        val half = IntArray(hn)
+        for (y in 0 until hh) {
+            for (x in 0 until hw) {
+                val i = (y * 2) * w + x * 2
+                val a = subj[i]
+                val b = subj[i + 1]
+                val c = subj[i + w]
+                val d = subj[i + w + 1]
+                val r = (((a shr 16) and 255) + ((b shr 16) and 255) + ((c shr 16) and 255) + ((d shr 16) and 255)) shr 2
+                val g = (((a shr 8) and 255) + ((b shr 8) and 255) + ((c shr 8) and 255) + ((d shr 8) and 255)) shr 2
+                val bl = ((a and 255) + (b and 255) + (c and 255) + (d and 255)) shr 2
+                half[y * hw + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or bl
             }
         }
-        num = boxBlurF(boxBlurF(num, hw, hh, 12), hw, hh, 12)
-        den = boxBlurF(boxBlurF(den, hw, hh, 12), hw, hh, 12)
-        val mid = (k - 1) / 2f
-        val depth = FloatArray(hn) { i -> if (den[i] > 1e-3f) num[i] / den[i] else mid }
-
-        val cx = (sx * hw).toInt().coerceIn(0, hw - 1)
-        val cy = (sy * hh).toInt().coerceIn(0, hh - 1)
-        var acc = 0f
-        var cntPx = 0
-        for (yy in max(cy - 10, 0)..min(cy + 10, hh - 1)) for (xx in max(cx - 10, 0)..min(cx + 10, hw - 1)) {
-            acc += depth[yy * hw + xx]
-            cntPx++
-        }
-        val s0 = acc / max(cntPx, 1)
-        val idx0 = s0.roundToInt().coerceIn(0, k - 1)
-        val amt = FloatArray(hn) { i -> ((abs(depth[i] - s0) - 0.5f) / 2f).coerceIn(0f, 1f) }
-
-        val sharp = frames[idx0]
-        val r3 = max(strength * 3, 3)
+        val r3 = max((strength * 3 * sc / 2f).toInt(), 2)
         val r2 = max(r3 * 2 / 3, 2)
         val r1 = max(r3 / 3, 1)
-        val b1 = blur2(sharp, w, h, r1)
-        val b2 = blur2(sharp, w, h, r2)
-        val b3 = blur2(sharp, w, h, r3)
+        val b1 = blur2(half, hw, hh, r1)
+        val b2 = blur2(half, hw, hh, r2)
+        val b3 = blur2(half, hw, hh, r3)
         val out = IntArray(w * h)
         for (y in 0 until h) {
-            val ro = (y shr 1) * hw
+            val ho = min(y shr 1, hh - 1) * hw
             for (x in 0 until w) {
+                val hi = ho + min(x shr 1, hw - 1)
+                val a = amt[hi] * 3f
                 val i = y * w + x
-                val a = amt[ro + min(x shr 1, hw - 1)] * 3f
+                val sharp = subj[i]
                 out[i] = when {
-                    a <= 0.001f -> sharp[i]
-                    a <= 1f -> mix(sharp[i], b1[i], a)
-                    a <= 2f -> mix(b1[i], b2[i], a - 1f)
-                    else -> mix(b2[i], b3[i], min(a - 2f, 1f))
+                    a <= 0.001f -> sharp
+                    a <= 1f -> mixArgb(sharp, b1[hi], a)
+                    a <= 2f -> mixArgb(b1[hi], b2[hi], a - 1f)
+                    else -> mixArgb(b2[hi], b3[hi], min(a - 2f, 1f))
                 }
             }
         }
         return out
-    }
-
-    private fun blur2(src: IntArray, w: Int, h: Int, r: Int): IntArray {
-        val rr = max(r * 7 / 10, 1)
-        return boxBlurArgb(boxBlurArgb(src, w, h, rr), w, h, rr)
-    }
-
-    private fun mix(p: Int, q: Int, t: Float): Int {
-        val ti = (t * 256f).toInt().coerceIn(0, 256)
-        val r = ((((p shr 16) and 255) * (256 - ti)) + (((q shr 16) and 255) * ti)) shr 8
-        val g = ((((p shr 8) and 255) * (256 - ti)) + (((q shr 8) and 255) * ti)) shr 8
-        val b = (((p and 255) * (256 - ti)) + ((q and 255) * ti)) shr 8
-        return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
     }
 }

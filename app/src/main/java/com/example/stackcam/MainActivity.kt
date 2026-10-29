@@ -13,6 +13,7 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.ImageFormat
 import android.graphics.Outline
+import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.graphics.Typeface
 import android.hardware.camera2.CameraCaptureSession
@@ -23,6 +24,7 @@ import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.MeteringRectangle
 import android.media.Image
 import android.media.ImageReader
 import android.media.MediaRecorder
@@ -55,6 +57,7 @@ import android.widget.Toast
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.max
@@ -62,11 +65,11 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 enum class Top(val label: String) {
-    VIDEO("VIDEO"), PHOTO("PHOTO"), PORTRAIT("PORTRAIT"), PRO("PRO"),
-    TIMELAPSE("TIME-LAPSE"), LONGEXP("LONG EXPOSURE"), ASTRO("ASTRO"), CLONE("CLONE")
+    VIDEO("VIDEO"), PHOTO("PHOTO"), PORTRAIT("PORTRAIT"), NIGHT("NIGHT"), PRO("PRO"), PANO("PANO"),
+    TIMELAPSE("TIME-LAPSE"), LONGEXP("LONG EXPOSURE"), ASTRO("ASTRO"), CLONE("CLONE"), DOC("DOCUMENT")
 }
 
-enum class Kind { PHOTO, AVERAGE, LIGHTEN, CLONE, ASTRO, BOKEH, TIMELAPSE }
+enum class Kind { PHOTO, AVERAGE, LIGHTEN, CLONE, ASTRO, BOKEH, TIMELAPSE, NIGHT, PANO, DOC }
 
 data class Preset(
     val label: String,
@@ -87,28 +90,51 @@ val PRESETS = listOf(
     Preset("Star trails", Kind.LIGHTEN, 180, "Long frames, focus at infinity. Tripod, dark sky.", fixedExpMs = 2000.0, fixedIso = 800, infinity = true),
 )
 
-private const val CLONE_SHOTS = 5
+private val NIGHT_LUT = IntArray(256) { i ->
+    val t = Math.pow(i / 255.0, 0.78)
+    (((t - 0.5) * 1.06 + 0.5).coerceIn(0.0, 1.0) * 255.0).toInt()
+}
 
 private class Run(val kind: Kind, val w: Int, val h: Int, var skip: Int, val rot: Int, val durMs: Long) {
     val startMs = SystemClock.elapsedRealtime()
-    val scratch = if (kind == Kind.TIMELAPSE) IntArray(0) else IntArray(w * h)
+    var scratch: IntArray =
+        if (kind == Kind.TIMELAPSE || kind == Kind.AVERAGE || kind == Kind.NIGHT || kind == Kind.CLONE) IntArray(0) else IntArray(w * h)
     var frames = 0
     @Volatile var want = false
-    var avg: AverageStacker? = null
+    @Volatile var afReady = true
+    @Volatile var d0 = 0f
+    var accum: YuvAccum? = null
     var lt: LightenStacker? = null
     var astro: AstroStacker? = null
-    val shots = ArrayList<IntArray>()
+    var bokeh: BokehAccum? = null
+    var pano: PanoStitcher? = null
+    val clones = ArrayList<YuvFrame>()
+    var cloneTarget = 5
+    var nightTarget = 10
+    var attempts = 0
+    var bestSharp = 0L
+    var lumRef: ByteArray? = null
     var tl: TimelapseEncoder? = null
     var tlUri: Uri? = null
     var builder: CaptureRequest.Builder? = null
     var steps = FloatArray(0)
     var step = 0
     var settleAt = 0L
-    var subjX = 0.5f
-    var subjY = 0.5f
     var strength = 6
     var stretch = true
+
+    fun release() {
+        accum = null
+        lt = null
+        astro = null
+        bokeh = null
+        pano = null
+        clones.clear()
+        scratch = IntArray(0)
+    }
 }
+
+private class Out(val px: IntArray, val w: Int, val h: Int, val rot: Int)
 
 private class NewVideo(val uri: Uri, val pfd: ParcelFileDescriptor)
 
@@ -141,6 +167,7 @@ class MainActivity : Activity() {
     private var reader: ImageReader? = null
     private var previewSurface: Surface? = null
     private var chars: CameraCharacteristics? = null
+    private var activeArray: Rect? = null
 
     private var sizes: List<Size> = listOf(Size(1920, 1440))
     private var videoSizes: List<Size> = listOf(Size(1440, 1080))
@@ -167,6 +194,9 @@ class MainActivity : Activity() {
     @Volatile private var tlIntervalS = 2
     @Volatile private var tlMin = 10
     @Volatile private var cloneSec = 3
+    @Volatile private var cloneShots = 5
+    @Volatile private var nightFrames = 10
+    @Volatile private var docBw = false
     @Volatile private var blur = 6
     @Volatile private var proAe = false
     @Volatile private var proAf = true
@@ -175,8 +205,7 @@ class MainActivity : Activity() {
     @Volatile private var focusP = 0
     @Volatile private var oisOn = false
     @Volatile private var stabMode = 0
-    @Volatile private var subjX = 0.5f
-    @Volatile private var subjY = 0.5f
+    @Volatile private var afRegion: MeteringRectangle? = null
     @Volatile private var devOri = 0
 
     @Volatile private var lastExpNs = 33_000_000L
@@ -213,6 +242,7 @@ class MainActivity : Activity() {
     private fun ts(): String = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
     private fun shutterLook() = if (mode == Top.VIDEO) 1 else 0
     private fun resetShutter() = ui { shutterView.set(shutterLook(), 0f, true) }
+    private fun progress(p: Float) = ui { shutterView.set(2, p.coerceIn(0f, 1f), true) }
 
     private fun fmtExp(ns: Long): String =
         if (ns >= 1_000_000_000L) String.format(Locale.US, "%.1f s", ns / 1e9)
@@ -242,13 +272,16 @@ class MainActivity : Activity() {
 
     private fun hintFor(t: Top): String = when (t) {
         Top.VIDEO -> "4:3 video with sound. Pick size and stabilisation below."
-        Top.PHOTO -> "Tap the shutter."
-        Top.PORTRAIT -> "Tap the subject, then hold still. Focus-sweep bokeh works best on still subjects."
+        Top.PHOTO -> "Tap the screen to focus, then shoot."
+        Top.PORTRAIT -> "Tap your subject to focus, then shoot and hold still. Background blur comes from a focus sweep."
+        Top.NIGHT -> "Handheld is fine. Hold still until the ring completes."
         Top.PRO -> "Manual shutter, ISO and focus."
+        Top.PANO -> "Press shoot, pan slowly and steadily, press again to finish. Hold the phone upright."
         Top.TIMELAPSE -> "Use a tripod. The screen stays on while shooting."
         Top.LONGEXP -> PRESETS[lePreset].hint
         Top.ASTRO -> "Tripod, dark sky, no moon. Stars are aligned, the ground will smear."
-        Top.CLONE -> "Tripod. 5 shots, move to a new spot after each one."
+        Top.CLONE -> "Tripod. Move to a new spot after each shot. Keep the background unchanged."
+        Top.DOC -> "Put the page on a darker surface and fill most of the frame."
     }
 
     private fun chip(text: String, active: Boolean, onClick: () -> Unit): TextView = TextView(this).apply {
@@ -367,9 +400,10 @@ class MainActivity : Activity() {
         }
         tv.setOnTouchListener { v, ev ->
             if (ev.action == MotionEvent.ACTION_UP) {
-                subjX = (ev.x / v.width).coerceIn(0f, 1f)
-                subjY = (ev.y / v.height).coerceIn(0f, 1f)
+                val nx = (ev.x / v.width).coerceIn(0f, 1f)
+                val ny = (ev.y / v.height).coerceIn(0f, 1f)
                 overlay.ring(ev.x, ev.y)
+                if (mode != Top.VIDEO && !capturing && !recording) focusAt(nx, ny)
             }
             true
         }
@@ -481,9 +515,19 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun allowedIdx(): List<Int> = sizes.indices.filter { i ->
+        val s = sizes[i]
+        when (mode) {
+            Top.PANO -> s.width <= 1920
+            Top.ASTRO -> s.width <= 3264
+            else -> true
+        }
+    }
+
     private fun selectTop(t: Top) {
         if (capturing || recording) return
         mode = t
+        afRegion = null
         for (i in 0 until carouselRow.childCount) {
             val c = carouselRow.getChildAt(i) as TextView
             val sel = c.tag == t
@@ -491,11 +535,16 @@ class MainActivity : Activity() {
             c.setTypeface(null, if (sel) Typeface.BOLD else Typeface.NORMAL)
             if (sel) c.post { carouselScroll.smoothScrollTo(c.left - (carouselScroll.width - c.width) / 2, 0) }
         }
+        val al = allowedIdx()
+        if (al.isNotEmpty() && resIdx !in al) {
+            resIdx = al.last()
+            if (::bg.isInitialized) bg.post { createSession() }
+        }
         shutterView.set(shutterLook(), 0f, true)
         configSliders()
         rebuildOptions()
         statusTv.text = hintFor(t)
-        applyPreview()
+        applyPreview(cancel = true)
         if (t == Top.VIDEO) requestAudioIfNeeded()
     }
 
@@ -550,8 +599,12 @@ class MainActivity : Activity() {
                     "Duration  " + (it + 1) + " min  (clip about " + clip + " s)"
                 }) { tlMin = it + 1 }
             }
-            Top.CLONE -> setSlider(0, 9, cloneSec - 1, { "Delay between shots  " + (it + 1) + " s" }) { cloneSec = it + 1 }
+            Top.CLONE -> {
+                setSlider(0, 9, cloneSec - 1, { "Delay between shots  " + (it + 1) + " s" }) { cloneSec = it + 1 }
+                setSlider(1, 5, cloneShots - 3, { "Shots  " + (it + 3) }) { cloneShots = it + 3 }
+            }
             Top.PORTRAIT -> setSlider(0, 9, blur - 1, { "Blur strength  " + (it + 1) }) { blur = it + 1 }
+            Top.NIGHT -> setSlider(0, 16, nightFrames - 4, { "Frames  " + (it + 4) }) { nightFrames = it + 4 }
             else -> {}
         }
         var any = false
@@ -561,18 +614,21 @@ class MainActivity : Activity() {
 
     private fun addChip(text: String, active: Boolean, onClick: () -> Unit) {
         optionsRow.addView(chip(text, active) {
-            onClick()
-            rebuildOptions()
+            if (!capturing && !recording) {
+                onClick()
+                rebuildOptions()
+            }
         })
     }
 
     private fun resChip() {
+        val al = allowedIdx()
+        if (al.size < 2) return
         val s = sizes[resIdx.coerceIn(0, sizes.size - 1)]
         addChip(String.format(Locale.US, "%.1f MP", s.width * s.height / 1e6), false) {
-            if (sizes.size > 1) {
-                resIdx = (resIdx + 1) % sizes.size
-                bg.post { createSession() }
-            }
+            val pos = al.indexOf(resIdx)
+            resIdx = al[(pos + 1) % al.size]
+            bg.post { createSession() }
         }
     }
 
@@ -587,7 +643,9 @@ class MainActivity : Activity() {
                 addChip(if (proAf) "FOCUS AUTO" else "FOCUS MANUAL", !proAf) { proAf = !proAf; configSliders(); applyPreview() }
                 resChip(); oisChip()
             }
-            Top.PORTRAIT -> addChip("TAP SUBJECT ON SCREEN", false) {}
+            Top.PORTRAIT -> { addChip("TAP SUBJECT", false) {}; resChip() }
+            Top.NIGHT -> { resChip(); oisChip() }
+            Top.PANO -> addChip("UPRIGHT, PAN SLOWLY", false) {}
             Top.VIDEO -> {
                 val vs = videoSizes[videoIdx.coerceIn(0, videoSizes.size - 1)]
                 addChip(vs.height.toString() + "p 4:3", false) { if (videoSizes.size > 1) videoIdx = (videoIdx + 1) % videoSizes.size }
@@ -610,6 +668,10 @@ class MainActivity : Activity() {
                 resChip()
             }
             Top.TIMELAPSE, Top.CLONE -> resChip()
+            Top.DOC -> {
+                addChip(if (docBw) "BLACK & WHITE" else "COLOUR", docBw) { docBw = !docBw }
+                resChip()
+            }
         }
     }
 
@@ -666,13 +728,14 @@ class MainActivity : Activity() {
         c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { minIso = it.lower; maxIso = it.upper }
         sensorOri = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
         minFocusDist = c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 10f
+        activeArray = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
         oisSupported = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
             ?.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON) == true
         eisSupported = c.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
             ?.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true
         val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         val avail = map?.getOutputSizes(ImageFormat.YUV_420_888)?.toList()
-        val okS = listOf(Size(1920, 1440), Size(3264, 2448)).filter { w ->
+        val okS = listOf(Size(1920, 1440), Size(3264, 2448), Size(4000, 3000)).filter { w ->
             avail == null || avail.any { it.width == w.width && it.height == w.height }
         }
         sizes = if (okS.isNotEmpty()) okS else listOf(avail!!.maxByOrNull { it.width * it.height }!!)
@@ -738,6 +801,17 @@ class MainActivity : Activity() {
 
     private val resultCb = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(s: CameraCaptureSession, req: CaptureRequest, res: TotalCaptureResult) {
+            val r = curRun
+            if (r != null) {
+                if (!r.afReady) {
+                    val st = res.get(CaptureResult.CONTROL_AF_STATE)
+                    if (st == CameraMetadata.CONTROL_AF_STATE_FOCUSED_LOCKED || st == CameraMetadata.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED) {
+                        r.d0 = res.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: lastFocus
+                        r.afReady = true
+                    }
+                }
+                return
+            }
             if (!capturing) {
                 res.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastExpNs = it }
                 res.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }
@@ -753,31 +827,62 @@ class MainActivity : Activity() {
         b.set(CaptureRequest.SENSOR_FRAME_DURATION, max(expNs, 33_333_333L))
     }
 
+    /** focus == null: autofocus (on the tapped region if there is one); otherwise a fixed lens position in diopters. */
     private fun setFocus(b: CaptureRequest.Builder, focus: Float?) {
         if (focus == null) {
-            b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            val reg = afRegion
+            if (reg != null) {
+                b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
+                b.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(reg))
+            } else {
+                b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            }
         } else {
             b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
             b.set(CaptureRequest.LENS_FOCUS_DISTANCE, focus)
         }
     }
 
-    private fun applyPreview() {
+    /** Tap position is in upright viewfinder coordinates (0..1); the sensor is rotated, so it is mapped first. */
+    private fun focusAt(nx: Float, ny: Float) {
+        val a = activeArray ?: return
+        val sx: Float
+        val sy: Float
+        if (sensorOri == 270) { sx = 1f - ny; sy = nx } else { sx = ny; sy = 1f - nx }
+        val half = a.width() / 10
+        val cx = a.left + (sx * a.width()).toInt()
+        val cy = a.top + (sy * a.height()).toInt()
+        val x0 = max(a.left, min(cx - half, a.right - 2 * half))
+        val y0 = max(a.top, min(cy - half, a.bottom - 2 * half))
+        afRegion = MeteringRectangle(x0, y0, 2 * half, 2 * half, MeteringRectangle.METERING_WEIGHT_MAX)
+        applyPreview(trigger = true)
+    }
+
+    private fun applyPreview(trigger: Boolean = false, cancel: Boolean = false) {
         if (!::bg.isInitialized) return
-        bg.post {
-            val cam = camera ?: return@post
-            val s = session ?: return@post
-            val ps = previewSurface ?: return@post
-            if (capturing || recording) return@post
-            try {
-                val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-                b.addTarget(ps)
-                if (mode == Top.PRO && !proAe) setExposure(b, seekToExp(expP), seekToIso(isoP))
-                setFocus(b, if (mode == Top.PRO && !proAf) focusDiopter(focusP) else null)
-                s.setRepeatingRequest(b.build(), resultCb, bg)
-            } catch (e: Exception) {
-                toast("Preview error: ${e.message}")
+        bg.post { previewNow(trigger, cancel) }
+    }
+
+    private fun previewNow(trigger: Boolean, cancel: Boolean) {
+        val cam = camera ?: return
+        val s = session ?: return
+        val ps = previewSurface ?: return
+        if (capturing || recording) return
+        try {
+            val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            b.addTarget(ps)
+            if (mode == Top.PRO && !proAe) setExposure(b, seekToExp(expP), seekToIso(isoP))
+            setFocus(b, if (mode == Top.PRO && !proAf) focusDiopter(focusP) else null)
+            s.setRepeatingRequest(b.build(), resultCb, bg)
+            if (trigger) {
+                b.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+                s.capture(b.build(), resultCb, bg)
+            } else if (cancel) {
+                b.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+                s.capture(b.build(), resultCb, bg)
             }
+        } catch (e: Exception) {
+            toast("Preview error: ${e.message}")
         }
     }
 
@@ -797,6 +902,16 @@ class MainActivity : Activity() {
         bg.post { beginRun() }
     }
 
+    private fun buildSteps(d0: Float): FloatArray {
+        val cand = floatArrayOf(d0, d0 * 1.8f, d0 * 1.35f, d0 * 0.75f, d0 * 0.5f, d0 * 0.3f, d0 * 0.15f, 0f)
+        val out = ArrayList<Float>()
+        for (c in cand) {
+            val v = c.coerceIn(0f, minFocusDist)
+            if (out.none { abs(it - v) < 0.06f }) out.add(v)
+        }
+        return out.toFloatArray()
+    }
+
     private fun beginRun() {
         val cam = camera
         val s = session
@@ -808,18 +923,21 @@ class MainActivity : Activity() {
         val kind = when (t) {
             Top.PHOTO, Top.PRO, Top.VIDEO -> Kind.PHOTO
             Top.PORTRAIT -> Kind.BOKEH
+            Top.NIGHT -> Kind.NIGHT
+            Top.PANO -> Kind.PANO
             Top.TIMELAPSE -> Kind.TIMELAPSE
             Top.LONGEXP -> PRESETS[lePreset].kind
             Top.ASTRO -> Kind.ASTRO
             Top.CLONE -> Kind.CLONE
+            Top.DOC -> Kind.DOC
         }
-        if ((kind == Kind.CLONE || kind == Kind.BOKEH || kind == Kind.TIMELAPSE) && rd.width > 2000) {
-            setStatus("This mode needs the 2.8 MP resolution. Change it in the options row.")
+        if (kind == Kind.PANO && rd.width > 1920) {
+            setStatus("Panorama uses the 2.8 MP resolution.")
             resetShutter()
             return
         }
         try {
-            var manualExp = kind != Kind.PHOTO && kind != Kind.TIMELAPSE
+            var manualExp = kind != Kind.PHOTO && kind != Kind.TIMELAPSE && kind != Kind.DOC
             if (t == Top.PRO) manualExp = !proAe
             var expNs = lastExpNs
             var iso = lastIso
@@ -835,17 +953,29 @@ class MainActivity : Activity() {
                 } else if (cap != null) {
                     val capNs = (cap * 1e6).toLong()
                     if (expNs > capNs) { iso = (iso.toDouble() * expNs / capNs).toInt(); expNs = capNs }
+                } else if (kind == Kind.AVERAGE) {
+                    // fill the gap between frames: stretch exposure toward 1/30 s, lowering ISO to compensate
+                    val frameNs = 33_333_333L
+                    if (expNs < frameNs) {
+                        val newIso = (iso.toDouble() * expNs / frameNs).toInt()
+                        if (newIso >= minIso) {
+                            expNs = frameNs; iso = newIso
+                        } else {
+                            expNs = (expNs * (iso.toDouble() / minIso)).toLong(); iso = minIso
+                        }
+                    }
                 }
+            } else if (kind == Kind.NIGHT) {
+                val capNs = 150_000_000L
+                if (expNs > capNs) { iso = (iso.toDouble() * expNs / capNs).toInt(); expNs = capNs }
             }
             expNs = expNs.coerceIn(minExp, maxExp)
             iso = iso.coerceIn(minIso, maxIso)
 
-            val steps = floatArrayOf(7f, 4.5f, 3f, 2f, 1.3f, 0.8f, 0.4f, 0f).map { min(it, minFocusDist) }.toFloatArray()
             var focus: Float? = null
             if (t == Top.PRO && !proAf) focus = focusDiopter(focusP)
             else if (t == Top.ASTRO || preset?.infinity == true) focus = 0f
-            else if (manualExp) focus = lastFocus
-            if (kind == Kind.BOKEH) focus = steps[0]
+            val useAf = focus == null && kind != Kind.TIMELAPSE
 
             val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             b.addTarget(ps)
@@ -870,54 +1000,67 @@ class MainActivity : Activity() {
                 else -> 0L
             }
             val skip = when {
-                kind == Kind.PHOTO && !manualExp -> 5
+                (kind == Kind.PHOTO || kind == Kind.DOC) && !manualExp -> 3
                 expNs > 500_000_000L -> 1
                 else -> 2
             }
             val r = Run(kind, rd.width, rd.height, skip, jpegRotation(), durMs)
             r.builder = b
-            val n = rd.width * rd.height
+            r.afReady = !useAf
+            r.cloneTarget = cloneShots
+            r.nightTarget = nightFrames
+            r.strength = blur
             when (kind) {
-                Kind.AVERAGE -> r.avg = AverageStacker(n)
-                Kind.LIGHTEN -> r.lt = LightenStacker(n)
+                Kind.AVERAGE, Kind.NIGHT -> r.accum = YuvAccum(rd.width, rd.height)
+                Kind.LIGHTEN -> r.lt = LightenStacker(rd.width * rd.height)
                 Kind.ASTRO -> { r.astro = AstroStacker(rd.width, rd.height, astroAlign); r.stretch = astroStretch }
-                Kind.BOKEH -> {
-                    r.steps = steps
-                    r.strength = blur
-                    r.subjX = subjX
-                    r.subjY = subjY
-                }
+                Kind.BOKEH -> r.bokeh = BokehAccum(rd.width, rd.height)
                 Kind.TIMELAPSE -> {
                     val clip = newVideo("Timelapse")
                     r.tlUri = clip.uri
                     r.tl = TimelapseEncoder(clip.pfd, rd.width, rd.height, r.rot)
                     r.want = true
                 }
+                Kind.CLONE, Kind.PANO -> r.want = true
                 else -> {}
             }
             curRun = r
             s.setRepeatingRequest(b.build(), resultCb, bg)
+            if (useAf) {
+                b.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+                s.capture(b.build(), resultCb, bg)
+                b.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+            }
             capturing = true
             when (kind) {
-                Kind.PHOTO -> setStatus("Capturing...")
+                Kind.PHOTO, Kind.DOC -> setStatus("Focusing...")
                 Kind.AVERAGE, Kind.LIGHTEN, Kind.ASTRO -> {
                     setStatus("Stacking...")
                     bg.postDelayed({ finishRun(r) }, durMs)
                     startTicker(r)
                 }
-                Kind.CLONE -> { setStatus("Get in position. Shot 1 in $cloneSec s"); scheduleWant(r, cloneSec * 1000L) }
-                Kind.BOKEH -> { r.settleAt = SystemClock.elapsedRealtime() + 600; setStatus("Hold still, sweeping focus...") }
+                Kind.NIGHT -> {
+                    setStatus("Hold still...")
+                    bg.postDelayed({ finishRun(r) }, 90_000L)
+                }
+                Kind.CLONE -> {
+                    setStatus("Focusing, then get in position. Shot 1 in $cloneSec s")
+                    scheduleWant(r, cloneSec * 1000L + 1500L)
+                }
+                Kind.BOKEH -> setStatus("Focusing on your subject...")
+                Kind.PANO -> setStatus("Pan slowly...")
                 Kind.TIMELAPSE -> {
                     setStatus("Time-lapse running")
                     bg.postDelayed({ finishRun(r) }, durMs)
                     startTicker(r)
                 }
             }
-            ui { shutterView.set(if (kind == Kind.PHOTO) 0 else 2, 0f, kind != Kind.PHOTO) }
+            ui { shutterView.set(if (kind == Kind.PHOTO || kind == Kind.DOC) 0 else 2, 0f, kind != Kind.PHOTO && kind != Kind.DOC) }
         } catch (e: Throwable) {
+            curRun?.release()
             curRun = null
             capturing = false
-            toast("Capture error: ${e.message}")
+            toast(if (e is OutOfMemoryError) "Not enough memory at this resolution. Pick a lower one." else "Capture error: " + e.message)
             resetShutter()
         }
     }
@@ -931,24 +1074,53 @@ class MainActivity : Activity() {
             override fun run() {
                 if (curRun !== r) return
                 val p = ((SystemClock.elapsedRealtime() - r.startMs).toFloat() / r.durMs).coerceIn(0f, 1f)
-                ui { shutterView.set(2, p, true) }
+                progress(p)
                 bg.postDelayed(this, 400)
             }
         }
         bg.postDelayed(tick, 400)
     }
 
+    private fun applyBokehFocus(r: Run) {
+        val b = r.builder ?: return
+        b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+        b.set(CaptureRequest.LENS_FOCUS_DISTANCE, r.steps[r.step])
+        try { session?.setRepeatingRequest(b.build(), resultCb, bg) } catch (_: Exception) {}
+    }
+
     private fun onFrame(img: Image) {
         val r = curRun ?: return
+        if (!r.afReady) {
+            if (SystemClock.elapsedRealtime() - r.startMs > 2500) {
+                r.afReady = true
+                r.d0 = lastFocus
+            } else {
+                return
+            }
+        }
         if (r.skip > 0) { r.skip--; return }
+        try {
+            handleFrame(r, img)
+        } catch (e: Throwable) {
+            curRun = null
+            capturing = false
+            r.release()
+            setStatus(if (e is OutOfMemoryError) "Out of memory. Pick a lower resolution." else "Frame error: " + e.javaClass.simpleName + " " + e.message)
+            applyPreview(cancel = true)
+            resetShutter()
+        }
+    }
+
+    private fun handleFrame(r: Run, img: Image) {
         when (r.kind) {
-            Kind.PHOTO -> {
+            Kind.PHOTO, Kind.DOC -> {
                 Yuv.toArgb(img, r.scratch)
                 finishRun(r)
             }
             Kind.AVERAGE -> {
-                Yuv.toArgb(img, r.scratch)
-                r.avg!!.add(r.scratch)
+                val acc = r.accum!!
+                acc.load(img)
+                acc.addLoaded(0, 0)
                 r.frames++
                 if (r.frames % 3 == 0) setStatus("Stacking... " + r.frames + " frames")
             }
@@ -964,35 +1136,92 @@ class MainActivity : Activity() {
                 r.frames++
                 setStatus("Astro: " + r.frames + " frames stacked")
             }
+            Kind.NIGHT -> {
+                val acc = r.accum!!
+                acc.load(img)
+                val lw = r.w / 4
+                val lh = r.h / 4
+                val low = acc.lowLum(4)
+                val sh = Align.sharp(low, lw, lh)
+                r.attempts++
+                val ref = r.lumRef
+                if (ref == null) {
+                    r.lumRef = low
+                    r.bestSharp = sh
+                    acc.addLoaded(0, 0)
+                    r.frames++
+                } else {
+                    if (sh < r.bestSharp * 7 / 10 && r.attempts < r.nightTarget * 2) return
+                    if (sh > r.bestSharp) r.bestSharp = sh
+                    val d = Align.shift(ref, low, lw, lh, 10, 10, 0, 0, 2)
+                    acc.addLoaded(d[0] * 4, d[1] * 4)
+                    r.frames++
+                }
+                progress(r.frames / r.nightTarget.toFloat())
+                setStatus("Night: " + r.frames + "/" + r.nightTarget + " frames")
+                if (r.frames >= r.nightTarget || r.attempts >= r.nightTarget * 2) finishRun(r)
+            }
             Kind.CLONE -> {
                 if (!r.want) return
                 r.want = false
-                Yuv.toArgb(img, r.scratch)
-                r.shots.add(r.scratch.copyOf())
-                ui { shutterView.set(2, r.shots.size / CLONE_SHOTS.toFloat(), true) }
-                if (r.shots.size >= CLONE_SHOTS) {
+                r.clones.add(YuvFrame.from(img))
+                progress(r.clones.size / r.cloneTarget.toFloat())
+                if (r.clones.size >= r.cloneTarget) {
                     finishRun(r)
                 } else {
-                    setStatus("Shot " + r.shots.size + "/" + CLONE_SHOTS + " taken. Move! Next in " + cloneSec + " s")
+                    setStatus("Shot " + r.clones.size + "/" + r.cloneTarget + " taken. Move! Next in " + cloneSec + " s")
                     scheduleWant(r, cloneSec * 1000L)
                 }
             }
             Kind.BOKEH -> {
-                if (SystemClock.elapsedRealtime() < r.settleAt) return
-                Yuv.toArgb(img, r.scratch)
-                r.shots.add(r.scratch.copyOf())
+                val bk = r.bokeh!!
+                val now = SystemClock.elapsedRealtime()
+                if (r.steps.isEmpty()) {
+                    r.steps = buildSteps(r.d0.coerceIn(0f, minFocusDist))
+                    r.step = 0
+                    if (r.steps.size < 3) {
+                        setStatus("Subject too far for the blur effect. Move closer.")
+                        finishRun(r)
+                        return
+                    }
+                    setStatus("Hold still, sweeping focus...")
+                    applyBokehFocus(r)
+                    r.settleAt = now + 600
+                    return
+                }
+                if (now < r.settleAt) return
+                bk.add(img, r.steps[r.step], r.step == 0, r.scratch)
                 r.step++
-                ui { shutterView.set(2, r.step / r.steps.size.toFloat(), true) }
+                progress(r.step / r.steps.size.toFloat())
                 if (r.step >= r.steps.size) {
                     finishRun(r)
                 } else {
-                    val b = r.builder
-                    if (b != null) {
-                        b.set(CaptureRequest.LENS_FOCUS_DISTANCE, r.steps[r.step])
-                        try { session?.setRepeatingRequest(b.build(), resultCb, bg) } catch (_: Exception) {}
-                    }
+                    applyBokehFocus(r)
                     r.settleAt = SystemClock.elapsedRealtime() + 450
                 }
+            }
+            Kind.PANO -> {
+                if (!r.want) return
+                r.want = false
+                Yuv.toArgb(img, r.scratch)
+                val rt = Rot.cw(r.scratch, r.w, r.h, r.rot)
+                var p = r.pano
+                if (p == null) {
+                    p = PanoStitcher(rt.w, rt.h)
+                    r.pano = p
+                }
+                val st = p.add(rt.px)
+                r.frames = p.frames
+                progress(p.painted / p.limit.toFloat())
+                setStatus(
+                    when (st) {
+                        2 -> "Too fast, pan slower (" + p.frames + " frames)"
+                        3 -> "Panorama full"
+                        else -> "Panorama: " + p.frames + " frames, keep panning"
+                    }
+                )
+                if (st == 3) { finishRun(r); return }
+                scheduleWant(r, 300)
             }
             Kind.TIMELAPSE -> {
                 if (!r.want) return
@@ -1021,39 +1250,46 @@ class MainActivity : Activity() {
         if (curRun !== r) return
         capturing = false
         curRun = null
-        setStatus("Processing...")
+        setStatus("Processing... (can take a few seconds)")
         ui { shutterView.set(0, 0f, false) }
-        applyPreview()
+        applyPreview(cancel = true)
         var saved: Uri? = null
         try {
             if (r.kind == Kind.TIMELAPSE) {
                 saved = finishTimelapse(r)
                 setStatus(if (saved != null) "Time-lapse saved to Movies/StackCam (" + r.frames + " frames)" else "No frames captured")
             } else {
-                val argb: IntArray? = when (r.kind) {
-                    Kind.PHOTO -> r.scratch
-                    Kind.AVERAGE -> if (r.frames > 0) r.avg!!.result() else null
-                    Kind.LIGHTEN -> if (r.frames > 0) r.lt!!.mx else null
-                    Kind.ASTRO -> if (r.frames > 0) r.astro!!.result(r.stretch) else null
-                    Kind.CLONE -> if (r.shots.size >= 2) Clone.composite(r.shots, r.w, r.h) else null
-                    Kind.BOKEH -> if (r.shots.size >= 3) {
-                        val sx: Float
-                        val sy: Float
-                        if (sensorOri == 270) { sx = 1f - r.subjY; sy = r.subjX } else { sx = r.subjY; sy = 1f - r.subjX }
-                        Bokeh.compose(r.shots, r.w, r.h, sx, sy, r.strength)
-                    } else null
+                val out: Out? = when (r.kind) {
+                    Kind.PHOTO -> Out(r.scratch, r.w, r.h, r.rot)
+                    Kind.AVERAGE -> r.accum?.let { if (it.frames > 0) Out(it.result(null), r.w, r.h, r.rot) else null }
+                    Kind.NIGHT -> r.accum?.let { if (it.frames > 0) Out(it.result(NIGHT_LUT), r.w, r.h, r.rot) else null }
+                    Kind.LIGHTEN -> r.lt?.let { if (r.frames > 0) Out(it.mx, r.w, r.h, r.rot) else null }
+                    Kind.ASTRO -> r.astro?.let { if (r.frames > 0) Out(it.result(r.stretch), r.w, r.h, r.rot) else null }
+                    Kind.CLONE -> if (r.clones.size >= 2) Out(CloneV2.composite(r.clones, r.w, r.h), r.w, r.h, r.rot) else null
+                    Kind.BOKEH -> r.bokeh?.let { if (it.shots >= 3) Out(it.result(r.strength), r.w, r.h, r.rot) else null }
+                    Kind.PANO -> r.pano?.finish()?.let { Out(it.px, it.w, it.h, 0) }
+                    Kind.DOC -> {
+                        val rt = Rot.cw(r.scratch, r.w, r.h, r.rot)
+                        val d = DocScan.process(rt.px, rt.w, rt.h, docBw)
+                        Out(d.px, d.w, d.h, 0)
+                    }
                     Kind.TIMELAPSE -> null
                 }
-                if (argb == null) {
+                r.release()
+                if (out == null) {
                     setStatus("Nothing to save (too few frames).")
                 } else {
-                    saved = savePhoto(argb, r.w, r.h, r.rot, mode.name.lowercase(Locale.US))
+                    saved = savePhoto(out.px, out.w, out.h, out.rot, mode.name.lowercase(Locale.US))
                     setStatus(if (saved != null) "Saved to Pictures/StackCam" else "Save failed")
                 }
             }
         } catch (e: Throwable) {
-            setStatus("Processing failed: " + e.javaClass.simpleName + " " + e.message)
+            setStatus(
+                if (e is OutOfMemoryError) "Out of memory. Pick a lower resolution."
+                else "Processing failed: " + e.javaClass.simpleName + " " + e.message
+            )
         }
+        r.release()
         resetShutter()
         saved?.let { updateThumb(it) }
     }

@@ -1,13 +1,13 @@
-# StackCam v0.2
+# StackCam v0.3
 
 Camera2 camera for a Vivo X60 Pro. Pure framework code, no dependencies, no INTERNET permission.
 
-Modes (swipe the strip above the shutter): Video, Photo, Portrait (focus-sweep bokeh), Pro (manual shutter/ISO/focus),
-Time-lapse (MP4), Long exposure (silky water, light trails, traffic trails, light painting, star trails),
-Astro (star-aligned stack with auto stretch for Milky Way), Clone.
+Modes (swipe the strip above the shutter): Video, Photo, Portrait (focus-sweep bokeh), Night (aligned multi-frame),
+Pro (manual shutter/ISO/focus), Pano, Time-lapse (MP4), Long exposure (silky water, light trails, traffic trails,
+light painting, star trails), Astro (star-aligned stack with stretch), Clone, Document (scan).
 
-Portrait UI. Photos save to Pictures/StackCam, videos to Movies/StackCam. Output is rotated using the phone's orientation sensor.
-Gear icon: mirror / flip preview and grid (use if the viewfinder ever looks flipped).
+Tap the viewfinder to focus. Resolution chip cycles 2.8 / 8 / 12 MP where the mode allows it.
+Photos go to Pictures/StackCam, videos to Movies/StackCam. Gear icon: mirror / flip preview and grid.
 
 ## Build with GitHub
 1. Upload everything in this folder to a GitHub repo (keep .github and app/debug.keystore).

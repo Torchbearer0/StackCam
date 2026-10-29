@@ -2,12 +2,29 @@ package com.example.stackcam
 
 import android.media.Image
 import android.media.MediaCodec
+import android.media.MediaCodecList
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.os.ParcelFileDescriptor
 
-/** Encodes camera YUV frames straight into an H.264 MP4, 30 fps playback. */
+/** AVC if an encoder supports the size, otherwise HEVC (needed above roughly 8 MP). */
+fun pickVideoMime(w: Int, h: Int): String {
+    val list = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+    for (mime in arrayOf(MediaFormat.MIMETYPE_VIDEO_AVC, MediaFormat.MIMETYPE_VIDEO_HEVC)) {
+        for (ci in list) {
+            if (!ci.isEncoder) continue
+            if (!ci.supportedTypes.any { it.equals(mime, true) }) continue
+            try {
+                if (ci.getCapabilitiesForType(mime).videoCapabilities.isSizeSupported(w, h)) return mime
+            } catch (_: Exception) {
+            }
+        }
+    }
+    return MediaFormat.MIMETYPE_VIDEO_AVC
+}
+
+/** Encodes camera YUV frames straight into an MP4 (AVC or HEVC), 30 fps playback. */
 class TimelapseEncoder(
     private val pfd: ParcelFileDescriptor,
     private val w: Int,
@@ -23,12 +40,13 @@ class TimelapseEncoder(
         private set
 
     init {
-        val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h)
+        val mime = pickVideoMime(w, h)
+        val fmt = MediaFormat.createVideoFormat(mime, w, h)
         fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-        fmt.setInteger(MediaFormat.KEY_BIT_RATE, 16_000_000)
+        fmt.setInteger(MediaFormat.KEY_BIT_RATE, (w.toLong() * h * 7L).coerceIn(10_000_000L, 80_000_000L).toInt())
         fmt.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
         fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-        codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        codec = MediaCodec.createEncoderByType(mime)
         codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         codec.start()
         muxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
